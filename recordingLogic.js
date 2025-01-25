@@ -7,6 +7,14 @@
  *  - Starting/stopping recordings
  *  - Converting and compressing audio
  *  - Calling Whisper & GPT
+ *
+ * NOTE: We still call OpenAI Whisper for transcription.
+ *       We now call DeepSeek for summarization instead
+ *       of the GPT-4o-mini model. We read the key from
+ *       process.env.DEEPSEEK_API_KEY.
+ *
+ * Updated to fix the "ERR_REQUIRE_ESM" issue with node-fetch
+ * by using dynamic import inside summarizeText().
  ************************************************************/
 
 const fs = require('fs');
@@ -14,6 +22,8 @@ const path = require('path');
 const { pipeline } = require('stream');
 const prism = require('prism-media');
 const { spawn } = require('child_process');
+// Removed the direct "require('node-fetch')" to avoid ESM error.
+// We'll dynamically import node-fetch inside the summarizeText() function.
 
 const { openai, sessions, INACTIVITY_LIMIT_MS } = require('./config');
 const { convertPcmToWav, compressWav } = require('./audioUtils');
@@ -51,7 +61,7 @@ function joinVoiceChannelAndPrepare(guildId, voiceChannel) {
     throw new Error('Already connected or session in progress.');
   }
 
-  // Add both selfDeaf: false and selfMute: false:
+  // Ensure the bot can hear and record
   const connection = joinVoiceChannel({
     channelId: voiceChannel.id,
     guildId: voiceChannel.guild.id,
@@ -247,32 +257,49 @@ async function stopRecordingAndTranscribe(guildId) {
 
 /**
  * summarizeText(guildId, text):
- * GPT (gpt-4o-mini) summarization
+ * Replaces old "gpt-4o-mini" summarization with a DeepSeek call.
+ * Use dynamic import for node-fetch to avoid ESM error.
  */
 async function summarizeText(guildId, text) {
   if (!text || !text.trim()) {
     return '[No text to summarize]';
   }
 
-  console.log(`[${guildId}] Summarizing transcript with GPT-o-mini...`);
+  console.log(`[${guildId}] Summarizing transcript with DeepSeek...`);
   try {
-    const resp = await openai.chat.completions.create({
-      model: 'gpt-4o-mini',
-      messages: [
-        {
-          role: 'system',
-          content: 'You are a helpful assistant that summarizes conversation transcripts.'
-        },
-        {
-          role: 'user',
-          content: `Please summarize this conversation:\n\n${text}`
-        }
-      ],
-      temperature: 0.7
+    // Dynamically import node-fetch (ESM) in a CommonJS file
+    const { default: fetch } = await import('node-fetch');
+
+    const response = await fetch("https://api.deepseek.com/chat/completions", {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        "Authorization": `Bearer ${process.env.DEEPSEEK_API_KEY}`
+      },
+      body: JSON.stringify({
+        model: "deepseek-reasoner",
+        messages: [
+          {
+            role: "system",
+            content: "You are a helpful assistant that summarizes conversation transcripts."
+          },
+          {
+            role: "user",
+            content: `Please summarize this conversation:\n\n${text}`
+          }
+        ],
+        stream: false
+      })
     });
-    return resp.choices[0].message.content.trim();
+
+    const result = await response.json();
+    let deepSeekSummary = '[Summary failed]';
+    if (result.choices && result.choices.length > 0 && result.choices[0].message) {
+      deepSeekSummary = result.choices[0].message.content.trim();
+    }
+    return deepSeekSummary;
   } catch (err) {
-    console.error(`[DEBUG][${guildId}] Error calling ChatCompletion for summary:`, err);
+    console.error(`[DEBUG][${guildId}] Error calling DeepSeek for summary:`, err);
     return '[Summary failed]';
   }
 }
