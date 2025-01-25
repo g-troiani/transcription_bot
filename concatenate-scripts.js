@@ -1,52 +1,49 @@
-/**
- * combine-scripts.js
+/************************************************************
+ * concatenate-scripts.js
  *
- * Usage:
- *   node combine-scripts.js
+ * This script concatenates multiple .js files in this folder
+ * into a single text file named "concatenate-scripts.txt".
  *
- * Description:
- *   Reads multiple JS files, concatenates them (omitting environment vars,
- *   node_modules, logs, etc.), and writes the combined code to combined_code.txt
- *   in the current directory.
- *
- * Modify the "filesToConcat" array to include any other JS files you want to combine.
- */
+ * Changes:
+ * - Removed "app.js" from the files array to prevent ENOENT.
+ * - Output is now "concatenate-scripts.txt" instead of "merged.js".
+ ************************************************************/
 
 const fs = require('fs');
 const path = require('path');
 
-// List the files you want to concatenate:
-const filesToConcat = [
-  {
-    name: 'deploy-commands.js',
-    relativePath: './commands/deploy-commands.js'
-  },
-  {
-    name: 'app.js',
-    relativePath: './app.js'
-  }
+// List of files to concatenate.
+// Removed 'app.js' because it doesn't exist in your folder.
+const files = [
+  'config.js',
+  'audioUtils.js',
+  'recordingLogic.js',
+  'bot.js'
 ];
 
-// The output file in the same directory:
-const outputFile = 'concatenated_scripts.txt';
+// Generate a .txt output with the same base name as this script.
+const scriptBaseName = path.basename(__filename, '.js');
+const outputFile = `${scriptBaseName}.txt`;
 
-// Build the result string by reading and appending each file's contents
-let combinedResult = '';
+let mergedContent = '';
 
-for (const file of filesToConcat) {
-  // Prepare a header comment for each file
-  combinedResult += `/*\nFile: ${file.name}\nPath: ${file.relativePath}\n*/\n\n`;
+files.forEach(file => {
+  const filePath = path.join(__dirname, file);
 
-  // Read the file contents
-  const filePath = path.join(__dirname, file.relativePath);
-  const fileContents = fs.readFileSync(filePath, 'utf-8');
+  // Optional: Check if file actually exists before reading
+  if (!fs.existsSync(filePath)) {
+    console.warn(`Skipping missing file: ${file}`);
+    return;
+  }
 
-  // Append to the result
-  combinedResult += fileContents + '\n\n';
-}
+  // Read the file content
+  const fileData = fs.readFileSync(filePath, 'utf8');
 
-// Write the concatenated code to cconcatenated_scripts.txt
-const outputPath = path.join(__dirname, outputFile);
-fs.writeFileSync(outputPath, combinedResult, 'utf-8');
+  // Append to mergedContent with a comment header
+  mergedContent += `\n/************************************************************\n * ${file}\n ************************************************************/\n\n`;
+  mergedContent += fileData + '\n';
+});
 
-console.log(`Combined code written to ${outputFile}`);
+// Write out the final file as text
+fs.writeFileSync(outputFile, mergedContent);
+console.log(`Scripts concatenated into "${outputFile}".`);
