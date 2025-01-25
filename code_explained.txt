@@ -1,0 +1,33 @@
+Below is a concise summary of how this Discord bot code works, step by step:
+
+Bot Setup & Configuration
+
+Reads credentials from .env (like DISCORD_TOKEN and OPENAI_API_KEY).
+Initializes a Discord client with the necessary gateway intents (so it can detect voice states and handle slash commands).
+Sets up an OpenAI client using OPENAI_API_KEY.
+Voice Connection & Recording
+
+When a user calls a slash command like /record, the bot joins the specified voice channel.
+startRecording hooks into Discord’s audio receiver for each user who speaks, piping the Opus-encoded data into a single raw PCM file on disk.
+Inactivity & Channel-Empty Auto-Stop
+
+If nobody speaks for a certain amount of time (5 minutes by default), or if all non-bot members leave the voice channel, the bot automatically ends the recording.
+This prevents indefinite recordings or idle sessions.
+Transcription
+
+When recording ends (either by /stop-transcription or auto-stop), the bot sends the PCM file to OpenAI’s Whisper Audio API (openai.audio.transcriptions.create), which returns the transcribed text.
+The text is saved in an in-memory object keyed by a session ID.
+Summarization
+
+Once the text is received, the bot optionally calls GPT-3.5-turbo to create a concise summary of the transcript.
+This summary is also saved in memory, along with the transcript text.
+User Commands
+
+/transcript [ID or recent]: Retrieve a past transcript or the most recent one.
+/summary [ID or recent]: Retrieve the summary for a past transcript.
+/leave-voice: Force the bot to exit the channel immediately.
+Old commands (join-transcription, stop-transcription) remain for backward compatibility.
+Posting Responses
+
+The bot sends messages in Discord showing short excerpts of the transcript (trimmed) and the summary in reply to relevant slash commands.
+In short, the bot listens, records raw audio, transcribes via OpenAI Whisper, summarizes with GPT-3.5, and manages sessions automatically for a smooth transcription workflow.

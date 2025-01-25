@@ -1,0 +1,35 @@
+transcription_bot/
+├─ commands/
+│   └─ deploy-commands.js      // Script to register slash commands
+├─ app.js                      // Main bot code
+├─ .env                        // Holds your DISCORD_TOKEN
+└─ package.json                // Node project config
+
+
+
+
+DeepSeek Code
+
+```javascript
+
+
+const response = await fetch("https://api.deepseek.com/chat/completions", {
+  method: "POST",
+  headers: {
+    "Content-Type": "application/json",
+    "Authorization": "Bearer <DeepSeek API Key>"
+  },
+  body: JSON.stringify({
+    model: "deepseek-reasoner",
+    messages: [
+      {role: "system", content: "You are a helpful assistant."},
+      {role: "user", content: "Your question here"}
+    ],
+    stream: false
+  })
+});
+
+const result = await response.json();
+
+
+```

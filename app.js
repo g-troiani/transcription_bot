@@ -1,0 +1,676 @@
+/************************************************************
+ * app.js
+ * Full code for a Discord bot that:
+ *  - Responds to old commands (join-transcription, stop-transcription)
+ *  - Implements new commands (/record, /start-transcription, /stop-transcription,
+ *    /transcript, /summary, /leave-voice)
+ *  - Captures voice data to .pcm, then converts to .wav, sends to Whisper
+ *  - Summarizes with GPT-4o-mini
+ *  - Inactivity & channel-empty auto-stop
+ *
+ * Dependencies:
+ *   discord.js, @discordjs/voice, prism-media, dotenv, openai, fs, child_process (for ffmpeg)
+ *
+ * Also ensure .env includes:
+ *   DISCORD_TOKEN=YourDiscordBotToken
+ *   OPENAI_API_KEY=YourOpenAIApiKey
+ ************************************************************/
+
+require('dotenv').config();
+
+const {
+  Client,
+  GatewayIntentBits,
+  Partials,
+  ChannelType
+} = require('discord.js');
+
+const {
+  joinVoiceChannel,
+  createAudioPlayer
+} = require('@discordjs/voice');
+
+const prism = require('prism-media');
+const fs = require('fs');
+const path = require('path');
+const { pipeline } = require('stream');
+const { spawn } = require('child_process'); // For ffmpeg
+
+// openai@4+ style
+const OpenAI = require('openai');
+// Fix: Use 'new' keyword when creating OpenAI client
+const openai = new OpenAI({
+  apiKey: process.env.OPENAI_API_KEY
+});
+
+/*
+sessions[guildId] = {
+  connection: <VoiceConnection> | null,
+  isRecording: boolean,
+  audioFilePath: string | null,
+  fileStreams: Map<userId, pipeline>,
+  transcripts: {
+    [sessionIdNumber]: { text: string, summary: string }
+  },
+  currentSessionId: number,
+  activeSessionStart: number | null,
+  lastSpokeTimestamp: number | null,
+  inactivityInterval: NodeJS.Timeout | null,
+  listenersAttached: boolean // <-- Ensures we only attach .speaking listeners once
+}
+*/
+const sessions = {};
+
+// Inactivity threshold (3 minutes)
+const INACTIVITY_LIMIT_MS = 3 * 60 * 1000;
+
+/**
+ * Helper function to compress WAV file by converting to mono and downsampling
+ * Reduces file size for Whisper API upload
+ */
+function compressWav(inputWav, outputWav) {
+  return new Promise((resolve, reject) => {
+    const ffmpeg = spawn('ffmpeg', [
+      '-y',            // Overwrite output
+      '-i', inputWav,  // Input WAV
+      '-ar', '16000',  // 16 kHz sample rate (Whisper's preferred rate)
+      '-ac', '1',      // Mono
+      '-c:a', 'pcm_s16le', // 16-bit PCM
+      outputWav
+    ]);
+
+    ffmpeg.on('close', (code) => {
+      if (code === 0) resolve();
+      else reject(new Error(`ffmpeg exited with code ${code}`));
+    });
+
+    ffmpeg.on('error', (err) => {
+      reject(err);
+    });
+  });
+}
+
+/**
+ * Helper function to convert PCM -> WAV using ffmpeg
+ */
+function convertPcmToWav(pcmFile, wavFile) {
+  return new Promise((resolve, reject) => {
+    // Ensure "ffmpeg" is on your system PATH or provide full path here
+    const ffmpeg = spawn('ffmpeg', [
+      '-y',             // Overwrite output
+      '-f', 's16le',    // PCM 16-bit little-endian
+      '-ar', '48000',   // Sample rate
+      '-ac', '2',       // Stereo
+      '-i', pcmFile,    // Input PCM
+      wavFile           // Output WAV
+    ]);
+
+    ffmpeg.on('close', (code) => {
+      if (code === 0) resolve();
+      else reject(new Error(`ffmpeg exited with code ${code}`));
+    });
+
+    ffmpeg.on('error', (err) => {
+      // If "ENOENT", ffmpeg is missing/not found
+      reject(err);
+    });
+  });
+}
+
+/**
+ * createOrGetSession(guildId):
+ * If no session object exists for the guild, create one.
+ */
+function createOrGetSession(guildId) {
+  if (!sessions[guildId]) {
+    sessions[guildId] = {
+      connection: null,
+      isRecording: false,
+      audioFilePath: null,
+      fileStreams: new Map(),
+      transcripts: {},
+      currentSessionId: 0,
+      activeSessionStart: null,
+      lastSpokeTimestamp: null,
+      inactivityInterval: null,
+      listenersAttached: false
+    };
+  }
+  return sessions[guildId];
+}
+
+/**
+ * joinVoiceChannelAndPrepare(guildId, voiceChannel):
+ * Creates a VoiceConnection, sets up event listeners, etc.
+ */
+function joinVoiceChannelAndPrepare(guildId, voiceChannel) {
+  const session = createOrGetSession(guildId);
+  if (session.connection) {
+    throw new Error('Already connected or session in progress.');
+  }
+
+  const connection = joinVoiceChannel({
+    channelId: voiceChannel.id,
+    guildId: voiceChannel.guild.id,
+    adapterCreator: voiceChannel.guild.voiceAdapterCreator
+  });
+
+  session.connection = connection;
+  session.isRecording = false;
+  session.activeSessionStart = null;
+  session.lastSpokeTimestamp = null;
+
+  // Attach speaking listeners ONCE if not already attached
+  if (!session.listenersAttached) {
+    const receiver = connection.receiver;
+
+    receiver.speaking.on('start', (userId) => {
+      if (!session.isRecording) return;
+      if (session.fileStreams.has(userId)) return;
+
+      session.lastSpokeTimestamp = Date.now();
+      console.log(`User ${userId} started speaking in guild ${guildId}`);
+
+      const opusStream = receiver.subscribe(userId, { end: 'manual' });
+      const decoder = new prism.opus.Decoder({
+        rate: 48000,
+        channels: 2,
+        frameSize: 960
+      });
+
+      if (!session.audioFilePath) return; // Safety check
+      const outStream = fs.createWriteStream(session.audioFilePath, { flags: 'a' });
+
+      const p = pipeline(opusStream, decoder, outStream, (err) => {
+        if (err) {
+          console.error(`Pipeline error for user ${userId} in guild ${guildId}:`, err);
+        }
+      });
+      session.fileStreams.set(userId, p);
+    });
+
+    receiver.speaking.on('end', (userId) => {
+      if (!session.isRecording) return;
+      console.log(`User ${userId} stopped speaking in guild ${guildId}`);
+      const p = session.fileStreams.get(userId);
+      if (p) {
+        session.fileStreams.delete(userId);
+      }
+    });
+
+    session.listenersAttached = true;
+  }
+
+  // Optionally create an audio player if needed
+  const player = createAudioPlayer();
+  connection.subscribe(player);
+}
+
+/**
+ * startRecording(guildId):
+ * Begin actual transcription recording by enabling session.isRecording and setting
+ * up an inactivity interval to auto-stop. The speaking listeners are attached in
+ * joinVoiceChannelAndPrepare, so no need to attach them again here.
+ */
+function startRecording(guildId) {
+  const session = createOrGetSession(guildId);
+  if (!session.connection) {
+    throw new Error('No voice connection to record from.');
+  }
+  if (session.isRecording) {
+    throw new Error('Already recording.');
+  }
+
+  session.currentSessionId += 1;
+  const sid = session.currentSessionId;
+  const fileName = `session_${guildId}_${sid}.pcm`; // raw PCM
+  const fullPath = path.join(__dirname, fileName);
+
+  session.audioFilePath = fullPath;
+  session.isRecording = true;
+  session.activeSessionStart = Date.now();
+  session.lastSpokeTimestamp = Date.now();
+  console.log(`[${guildId}] Starting recording -> ${fileName}`);
+
+  // Inactivity auto-stop
+  if (session.inactivityInterval) {
+    clearInterval(session.inactivityInterval);
+  }
+  session.inactivityInterval = setInterval(async () => {
+    if (!session.isRecording) return;
+    const now = Date.now();
+    if (now - session.lastSpokeTimestamp > INACTIVITY_LIMIT_MS) {
+      console.log(`[${guildId}] Inactivity reached ${INACTIVITY_LIMIT_MS / 1000}s, stopping transcription...`);
+      clearInterval(session.inactivityInterval);
+      session.inactivityInterval = null;
+      try {
+        const transcriptText = await stopRecordingAndTranscribe(guildId);
+        const summary = await summarizeText(guildId, transcriptText);
+
+        const sessionId = session.currentSessionId;
+        session.transcripts[sessionId] = {
+          text: transcriptText,
+          summary: summary
+        };
+
+        leaveVoiceChannel(guildId);
+      } catch (err) {
+        console.error('Error stopping due to inactivity:', err);
+      }
+    }
+  }, 20000);
+}
+
+/**
+ * stopRecordingAndTranscribe(guildId) -> final transcript text
+ * Closes all streams, converts PCM -> WAV, calls the OpenAI Whisper API, returns text.
+ */
+async function stopRecordingAndTranscribe(guildId) {
+  const session = createOrGetSession(guildId);
+  if (!session.isRecording) {
+    throw new Error('Not currently recording.');
+  }
+
+  // Stop recording
+  session.isRecording = false;
+  for (const [userId] of session.fileStreams.entries()) {
+    session.fileStreams.delete(userId);
+  }
+
+  if (session.inactivityInterval) {
+    clearInterval(session.inactivityInterval);
+    session.inactivityInterval = null;
+  }
+
+  console.log(`[${guildId}] Recording ended. Now calling OpenAI Whisper API...`);
+
+  const pcmPath = session.audioFilePath;
+  if (!pcmPath || !fs.existsSync(pcmPath)) {
+    throw new Error(`Audio file not found at ${pcmPath}`);
+  }
+
+  // Convert .pcm => .wav
+  const wavPath = pcmPath.replace('.pcm', '.wav');
+
+  try {
+    await convertPcmToWav(pcmPath, wavPath);
+  } catch (convErr) {
+    console.error(`Error converting PCM to WAV: ${convErr}`);
+    return '[Conversion to WAV failed]';
+  }
+
+  // Compress the .wav file
+  const compressedWavPath = wavPath.replace('.wav', '.compressed.wav');
+  try {
+    await compressWav(wavPath, compressedWavPath);
+    console.log(`[DEBUG] Successfully compressed ${wavPath} to ${compressedWavPath}`);
+  } catch (err) {
+    console.error('[DEBUG] Compression failed:', err);
+    return '[Compression failed]';
+  }
+
+  // Debug: check compressed file size & log before Whisper call
+  try {
+    const stats = fs.statSync(compressedWavPath);
+    console.log(`[DEBUG] Compressed .wav file size: ${stats.size} bytes at path: ${compressedWavPath}`);
+  } catch (e) {
+    console.error('[DEBUG] Could not stat the compressed .wav file:', e);
+  }
+  console.log(`[DEBUG] Attempting to send ${compressedWavPath} to Whisper...`);
+
+  let transcriptionText = '';
+  try {
+    // Now call Whisper with the compressed .wav file
+    const transcription = await openai.audio.transcriptions.create({
+      file: fs.createReadStream(compressedWavPath),
+      model: 'whisper-1'
+    });
+    transcriptionText = (transcription.text || '').trim();
+    console.log(`[DEBUG] Whisper completed successfully.`);
+    console.log(`[${guildId}] Whisper transcription result:\n${transcriptionText}`);
+  } catch (err) {
+    console.error('Error calling Whisper API:', err);
+    transcriptionText = '[Transcription failed or returned empty]';
+  }
+
+  return transcriptionText;
+}
+
+/**
+ * summarizeText(guildId, text):
+ * Calls GPT-4-o mini via the new v4 usage: openai.chat.completions.create(...)
+ */
+async function summarizeText(guildId, text) {
+  if (!text || !text.trim()) {
+    return '[No text to summarize]';
+  }
+
+  console.log(`[${guildId}] Summarizing transcript with GPT-o-mini...`);
+  try {
+    const summaryResp = await openai.chat.completions.create({
+      model: 'gpt-4o-mini',
+      messages: [
+        {
+          role: 'system',
+          content: 'You are a helpful assistant that summarizes conversation transcripts.'
+        },
+        {
+          role: 'user',
+          content: `Please summarize this conversation:\n\n${text}`
+        }
+      ],
+      temperature: 0.7
+    });
+    const summary = summaryResp.choices[0].message.content.trim();
+    return summary;
+  } catch (err) {
+    console.error('Error calling ChatCompletion for summary:', err);
+    return '[Summary failed]';
+  }
+}
+
+/**
+ * leaveVoiceChannel(guildId):
+ * Leaves the current voice channel, discarding any unfinalized data if still recording.
+ */
+function leaveVoiceChannel(guildId) {
+  const session = sessions[guildId];
+  if (!session || !session.connection) {
+    throw new Error('Not connected to any channel in this guild.');
+  }
+  // If still recording, stop it
+  if (session.isRecording) {
+    console.warn(`Guild ${guildId} forcibly leaving while still recording—data may be incomplete.`);
+    session.isRecording = false;
+    session.fileStreams.clear();
+  }
+  if (session.inactivityInterval) {
+    clearInterval(session.inactivityInterval);
+    session.inactivityInterval = null;
+  }
+
+  session.connection.destroy();
+  session.connection = null;
+  console.log(`[${guildId}] Left the voice channel.`);
+}
+
+// ---------------------------------------------------------------------------
+// Set up the Discord Client and handle slash commands
+// ---------------------------------------------------------------------------
+
+const client = new Client({
+  intents: [
+    GatewayIntentBits.Guilds,
+    GatewayIntentBits.GuildVoiceStates,
+    GatewayIntentBits.GuildMessages,
+    GatewayIntentBits.MessageContent
+  ],
+  partials: [Partials.Channel]
+});
+
+client.on('interactionCreate', async (interaction) => {
+  if (!interaction.isChatInputCommand()) return;
+
+  const { commandName } = interaction;
+  const guildId = interaction.guildId;
+
+  // Old Example Commands
+  if (commandName === 'join-transcription') {
+    const voiceChannel = interaction.options.getChannel('channel');
+    if (!voiceChannel || voiceChannel.type !== ChannelType.GuildVoice) {
+      return interaction.reply({ content: 'Please specify a valid voice channel.', ephemeral: true });
+    }
+    try {
+      joinVoiceChannelAndPrepare(guildId, voiceChannel);
+      await interaction.reply(`Joined ${voiceChannel.name}. (Old join-transcription command)`);
+    } catch (error) {
+      console.error(error);
+      await interaction.reply({ content: `Failed to join: ${error.message}`, ephemeral: true });
+    }
+    return;
+  }
+
+  if (commandName === 'stop-transcription') {
+    // This is the old "stop-transcription" command
+    const session = sessions[guildId];
+    if (!session || !session.connection) {
+      return interaction.reply({ content: 'Not currently in a voice channel.', ephemeral: true });
+    }
+
+    // If not recording, no big operation => respond quickly
+    if (!session.isRecording) {
+      leaveVoiceChannel(guildId);
+      return interaction.reply('Stopped (old command) and left the channel.');
+    }
+
+    // If actively recording, defer, then transcribe
+    try {
+      await interaction.deferReply(); // <--- NEW: Defer to avoid 3s timeout
+      const transcriptText = await stopRecordingAndTranscribe(guildId);
+      const summary = await summarizeText(guildId, transcriptText);
+
+      const sid = session.currentSessionId;
+      session.transcripts[sid] = {
+        text: transcriptText,
+        summary
+      };
+
+      await interaction.editReply({
+        content: `**[Old stop-transcription Command]**\nHere's the final transcript (session #${sid}):\n\`\`\`${transcriptText.slice(0, 1500)}\`\`\`\n\n**Summary**:\n${summary}`
+      });
+
+      leaveVoiceChannel(guildId);
+    } catch (error) {
+      console.error(error);
+      await interaction.editReply({ content: `Error stopping transcription: ${error.message}` });
+    }
+    return;
+  }
+
+  // --------------------------------------------------------
+  // New Commands
+  // --------------------------------------------------------
+
+  if (commandName === 'record') {
+    const voiceChannel = interaction.options.getChannel('channel');
+    if (!voiceChannel || voiceChannel.type !== ChannelType.GuildVoice) {
+      return interaction.reply({ content: 'Please select a valid voice channel.', ephemeral: true });
+    }
+
+    const session = createOrGetSession(guildId);
+    if (session.connection) {
+      return interaction.reply({ content: 'Bot is already connected or busy in this guild.', ephemeral: true });
+    }
+
+    try {
+      joinVoiceChannelAndPrepare(guildId, voiceChannel);
+      startRecording(guildId);
+      await interaction.reply(`Recording started in ${voiceChannel.name}. Will finalize automatically or via /stop-transcription.`);
+    } catch (err) {
+      console.error(err);
+      return interaction.reply({ content: `Failed to record: ${err.message}`, ephemeral: true });
+    }
+    return;
+  }
+
+  else if (commandName === 'start-transcription') {
+    const session = sessions[guildId];
+    if (!session.connection) {
+      return interaction.reply({ content: 'Bot is not in a voice channel. Please join or use /record.', ephemeral: true });
+    }
+    if (session.isRecording) {
+      return interaction.reply({ content: 'Already recording.', ephemeral: true });
+    }
+    try {
+      startRecording(guildId);
+      await interaction.reply('Started transcription manually.');
+    } catch (err) {
+      console.error(err);
+      await interaction.reply({ content: `Error: ${err.message}`, ephemeral: true });
+    }
+    return;
+  }
+
+  else if (commandName === 'stop-transcription') {
+    // This is the NEW "stop-transcription" command
+    const session = sessions[guildId];
+    if (!session || !session.connection) {
+      return interaction.reply({ content: 'Not in a voice channel.', ephemeral: true });
+    }
+
+    // If not recording, we can immediately reply
+    if (!session.isRecording) {
+      leaveVoiceChannel(guildId);
+      return interaction.reply('No active recording found. Bot left the channel.');
+    }
+
+    // If actively recording, defer, then transcribe
+    try {
+      await interaction.deferReply(); // <--- NEW: Defer to avoid 3s timeout
+      const transcriptText = await stopRecordingAndTranscribe(guildId);
+      const summaryText = await summarizeText(guildId, transcriptText);
+      const sid = session.currentSessionId;
+
+      session.transcripts[sid] = {
+        text: transcriptText,
+        summary: summaryText
+      };
+
+      await interaction.editReply({
+        content: `**[Stop-Transcription Command]**\n**Transcript (session #${sid})**:\n\`\`\`${transcriptText.slice(0, 1500)}\`\`\`\n\n**Summary**:\n${summaryText}`
+      });
+
+      leaveVoiceChannel(guildId);
+    } catch (error) {
+      console.error(error);
+      await interaction.editReply({ content: `Error stopping transcription: ${error.message}` });
+    }
+    return;
+  }
+
+  else if (commandName === 'transcript') {
+    const requestedId = interaction.options.getString('id');
+    const session = sessions[guildId];
+    if (!session) {
+      return interaction.reply({ content: 'No transcripts found in this guild.', ephemeral: true });
+    }
+
+    let sid;
+    if (!requestedId) {
+      sid = session.currentSessionId;
+    } else if (requestedId.toLowerCase() === 'recent') {
+      sid = session.currentSessionId;
+    } else {
+      sid = parseInt(requestedId, 10);
+      if (isNaN(sid)) {
+        return interaction.reply({ content: 'Invalid session ID. Use an integer or "recent".', ephemeral: true });
+      }
+    }
+
+    const data = session.transcripts[sid];
+    if (!data) {
+      return interaction.reply({ content: `No transcript found for session #${sid}`, ephemeral: true });
+    }
+
+    await interaction.reply({
+      content: `**Transcript for session #${sid}:**\n\`\`\`${data.text.slice(0, 1500)}\`\`\``,
+      ephemeral: false
+    });
+    return;
+  }
+
+  else if (commandName === 'summary') {
+    const requestedId = interaction.options.getString('id');
+    const session = sessions[guildId];
+    if (!session) {
+      return interaction.reply({ content: 'No transcripts found in this guild.', ephemeral: true });
+    }
+
+    let sid;
+    if (!requestedId) {
+      sid = session.currentSessionId;
+    } else if (requestedId.toLowerCase() === 'recent') {
+      sid = session.currentSessionId;
+    } else {
+      sid = parseInt(requestedId, 10);
+      if (isNaN(sid)) {
+        return interaction.reply({ content: 'Invalid session ID. Use an integer or "recent".', ephemeral: true });
+      }
+    }
+
+    const data = session.transcripts[sid];
+    if (!data) {
+      return interaction.reply({ content: `No transcript found for session #${sid}`, ephemeral: true });
+    }
+
+    await interaction.reply({
+      content: `**Summary for session #${sid}:**\n${data.summary}`,
+      ephemeral: false
+    });
+    return;
+  }
+
+  else if (commandName === 'leave-voice') {
+    try {
+      leaveVoiceChannel(guildId);
+      await interaction.reply('Left the voice channel and discarded any unfinalized data.');
+    } catch (err) {
+      console.error(err);
+      await interaction.reply({ content: `Error leaving: ${err.message}`, ephemeral: true });
+    }
+    return;
+  }
+});
+
+// ---------------------------------------------------------------------------
+// 6) VoiceStateUpdate for Channel-Empty Auto-Stop
+// ---------------------------------------------------------------------------
+client.on('voiceStateUpdate', async (oldState, newState) => {
+  const guildId = oldState.guild.id;
+  const session = sessions[guildId];
+  if (!session || !session.connection) return;
+
+  const botChannelId = session.connection.joinConfig.channelId;
+  if (!botChannelId) return;
+
+  const voiceChannel = oldState.guild.channels.cache.get(botChannelId);
+  if (!voiceChannel) return;
+
+  // Are there any non-bot members left?
+  const nonBotMembers = voiceChannel.members.filter(member => !member.user.bot);
+  if (nonBotMembers.size === 0) {
+    console.log(`Auto-stop: Channel is empty in guild ${guildId}`);
+    try {
+      if (session.isRecording) {
+        const transcriptText = await stopRecordingAndTranscribe(guildId);
+        const summary = await summarizeText(guildId, transcriptText);
+
+        const sid = session.currentSessionId;
+        session.transcripts[sid] = {
+          text: transcriptText,
+          summary
+        };
+      }
+    } catch (err) {
+      console.error('Error auto-stopping due to empty channel:', err);
+    } finally {
+      leaveVoiceChannel(guildId);
+    }
+  }
+});
+
+// ---------------------------------------------------------------------------
+// 7) Bot Login
+// ---------------------------------------------------------------------------
+client.once('ready', () => {
+  console.log(`Logged in as ${client.user.tag}! Bot is online.`);
+});
+
+client.login(process.env.DISCORD_TOKEN);
+
+// ---------------------------------------------------------------------------
+// Optional: Catch unhandled promise rejections (helps debug hidden issues)
+// ---------------------------------------------------------------------------
+process.on('unhandledRejection', (reason, promise) => {
+  console.error('[DEBUG] Unhandled Rejection:', reason);
+});
